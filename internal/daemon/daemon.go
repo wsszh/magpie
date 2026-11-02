@@ -7,21 +7,26 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/agentenv"
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/autostart"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/proc"
 )
 
@@ -103,12 +108,67 @@ func Install(o Options) error {
 	if err != nil {
 		return err
 	}
+	// the login item is only the setting: an app opened by hand, or opened
+	// at login before autostart was turned off, keeps the port until it
+	// quits. Writing the service beside it writes one that fails on the
+	// port and is started again, failing again.
+	if pid := gatewayTaken(servicePID()); pid != 0 {
+		return fmt.Errorf("a magpie already serves the gateway on %s (pid %d): quit it first, or keep it open and skip the service", gateway.Addr(), pid)
+	}
 	widenPath()
 	if err := m.install(exe, serveArgs(o), withKey(environ(), o)); err != nil {
 		return err
 	}
 	os.Remove(removedMark())
 	return nil
+}
+
+// gatewayTaken is the pid of a magpie other than the service that listens on
+// the gateway's port, 0 when none does: its own program is a magpie's, so an
+// app opened by hand and a `magpie serve` someone started both count. When the
+// processes can't be listed the install goes on as it did, rather than being
+// refused on a guess.
+// servicePID is the service's own pid, whose port is the service's to hold
+// when Install writes it again. A var so tests need neither a magpie listening
+// on a port of the machine nor a service of the system.
+var gatewayTaken = func(servicePID int) int {
+	_, p, err := net.SplitHostPort(gateway.Addr())
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(p)
+	if err != nil || port == 0 {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pids, err := proc.ListeningOn(ctx, port)
+	if err != nil {
+		return 0
+	}
+	for _, pid := range pids {
+		if pid == servicePID || pid == os.Getpid() {
+			continue
+		}
+		if path, err := proc.Executable(pid); err == nil && proc.IsMagpie(path) {
+			return pid
+		}
+	}
+	return 0
+}
+
+// servicePID is the pid the system says the service runs, 0 when it isn't
+// running: a var so the platform tests need no service.
+var servicePID = func() int {
+	m, err := current()
+	if err != nil {
+		return 0
+	}
+	st, err := m.status()
+	if err != nil || !st.Running {
+		return 0
+	}
+	return st.PID
 }
 
 // removedMark is there once the user removed the service (Uninstall): what
